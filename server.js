@@ -5,8 +5,7 @@ import express from "express";
     const app = express();
     app.use(express.json());
 
-    // Healthcheck endpoint for Render
-    app.get("/", (req, res) => res.send("Edge TTS + FFmpeg service is running."));
+    app.get("/", (req, res) => res.send("Edge TTS + FFmpeg service is live."));
 
     app.post("/tts", async (req, res) => {
       const { text, voice = "km-KH-SreymomNeural", speed = "1.0x" } = req.body;
@@ -14,14 +13,12 @@ import express from "express";
 
       try {
         const tts = new MsEdgeTTS();
-        // Use Microsoft Edge standard audio stream
         await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
 
-        const readable = tts.toStream(text, {
-          rate: speed === "1.25x" ? "+25%" : speed === "1.5x" ? "+50%" : speed === "0.75x" ? "-25%" : "+0%"
-        });
+        const rate = speed === "1.25x" ? "+25%" : speed === "1.5x" ? "+50%" : speed === "0.75x" ? "-25%" : "+0%";
+        const { audioStream } = tts.toStream(text, { rate });
 
-        // Spawn FFmpeg to convert MP3 stream into native Telegram Ogg Opus (mono, 48kHz, 48kbps)
+        // Spawn FFmpeg to convert MP3 stream into Telegram native Ogg Opus (48kHz Mono)
         const ffmpeg = spawn("ffmpeg", [
           "-i", "pipe:0",       // Read MP3 from stdin
           "-c:a", "libopus",    // Encode with Opus codec
@@ -35,7 +32,7 @@ import express from "express";
         res.setHeader("Content-Type", "audio/ogg");
         res.setHeader("Access-Control-Allow-Origin", "*");
 
-        readable.pipe(ffmpeg.stdin);
+        audioStream.pipe(ffmpeg.stdin);
         ffmpeg.stdout.pipe(res);
 
         ffmpeg.stderr.on("data", () => {}); // silence ffmpeg logs
