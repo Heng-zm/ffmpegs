@@ -8,6 +8,6 @@
       },
       "dependencies": {
         "express": "^4.21.0",
-        "msedge-tts": "^1.4.1"
+        "msedge-tts": "^2.1.1"
       }
     }
