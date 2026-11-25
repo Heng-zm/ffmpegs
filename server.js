@@ -5,12 +5,16 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 
 // ---------- Config (override via environment variables) ----------
-const VERSION = "1.4.0-adaptive";
+const VERSION = "1.5.0-unlimited";
 const PORT = Number(process.env.PORT) || 3000;
 const API_KEY = process.env.API_KEY || "";                    // empty = auth disabled
-const MAX_TEXT = Number(process.env.MAX_TEXT) || 2000;        // characters per request
+const MAX_TEXT = Number(process.env.MAX_TEXT) || 0;           // characters per request, 0 = unlimited
+const JSON_LIMIT = process.env.JSON_LIMIT || "5mb";           // max request body size
+const RATE_LIMIT = process.env.RATE_LIMIT === undefined ? 30 : Number(process.env.RATE_LIMIT); // requests/min/IP, 0 = off
+const MAX_TIMEOUT_MS = Number(process.env.MAX_TIMEOUT_MS) || 600_000; // hard ceiling for one request (10 min)
+const CACHE_MAX_BYTES = 2 * 1024 * 1024;                          // clips larger than this are not cached
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 4;
-const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 60_000;
+const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 60_000;   // base timeout; grows with the number of chunks
 const CACHE_MAX = Number(process.env.CACHE_MAX) || 200;       // cached clips
 const CHUNK_MAX = Number(process.env.CHUNK_MAX) || 40;        // starting max characters per Edge request
 const MIN_CHUNK = 10;                                         // never split below this many characters
@@ -242,12 +246,14 @@ async function synthesize(text, voice, rate, signal, chunkMax = chunkLimit(voice
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "32kb" }));
+app.use(express.json({ limit: JSON_LIMIT }));
 
 app.get("/", (_req, res) => res.send("Edge TTS + FFmpeg service is live."));
 app.get("/health", (_req, res) => res.json({ ok: true, version: VERSION, active, cached: cache.size }));
 
-const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const limiter = RATE_LIMIT > 0
+  ? rateLimit({ windowMs: 60_000, limit: RATE_LIMIT, standardHeaders: true, legacyHeaders: false })
+  : (_req, _res, next) => next();
 
 let active = 0;
 
@@ -256,7 +262,7 @@ app.post("/tts", limiter, async (req, res) => {
 
   const { text, voice = DEFAULT_VOICE, speed = "1.0x" } = req.body ?? {};
   if (typeof text !== "string" || !text.trim()) return res.status(400).json({ error: "Missing text" });
-  if (text.length > MAX_TEXT) return res.status(413).json({ error: `Text exceeds ${MAX_TEXT} characters` });
+  if (MAX_TEXT && text.length > MAX_TEXT) return res.status(413).json({ error: `Text exceeds ${MAX_TEXT} characters` });
   if (typeof voice !== "string" || !VOICE_RE.test(voice)) return res.status(400).json({ error: "Invalid voice" });
 
   const rate = parseRate(speed);
@@ -282,12 +288,15 @@ app.post("/tts", limiter, async (req, res) => {
 
   const client = new AbortController();
   res.on("close", () => { if (!res.writableFinished) client.abort(new Error("client closed")); });
-  const signal = AbortSignal.any([client.signal, AbortSignal.timeout(TIMEOUT_MS)]);
+  // timeout grows with text length (~1.5 s per chunk), capped by MAX_TIMEOUT_MS
+  const estChunks = splitText(text, chunkLimit(voice)).length;
+  const timeoutMs = Math.min(MAX_TIMEOUT_MS, TIMEOUT_MS + estChunks * 1500);
+  const signal = AbortSignal.any([client.signal, AbortSignal.timeout(timeoutMs)]);
 
   active++;
   try {
     const { opus } = await synthesize(text, voice, rate, signal);
-    cacheSet(key, opus);
+    if (opus.length <= CACHE_MAX_BYTES) cacheSet(key, opus);
     if (!res.destroyed) send(opus, false);
   } catch (err) {
     console.error(`TTS error: ${err.message} (voice=${voice} rate=${rate} len=${len(text)} start=${JSON.stringify(text.slice(0, 40))})`);
