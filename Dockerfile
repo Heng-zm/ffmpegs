@@ -1,14 +1,17 @@
 FROM node:20-alpine
 
-    # Install FFmpeg and Opus audio codecs
-    RUN apk add --no-cache ffmpeg opus
+# FFmpeg on Alpine already includes libopus
+RUN apk add --no-cache ffmpeg
 
-    WORKDIR /app
+ENV NODE_ENV=production
+WORKDIR /app
 
-    COPY package*.json ./
-    RUN npm install --production
+COPY package*.json ./
+RUN npm install --omit=dev && npm cache clean --force
 
-    COPY server.js .
+COPY --chown=node:node server.js .
 
-    EXPOSE 3000
-    CMD ["node", "server.js"]
+# Render injects PORT (default 10000); server.js reads process.env.PORT
+USER node
+EXPOSE 3000
+CMD ["node", "server.js"]
