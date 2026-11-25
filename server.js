@@ -5,14 +5,15 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 
 // ---------- Config (override via environment variables) ----------
-const VERSION = "1.3.0-chunked";
+const VERSION = "1.4.0-adaptive";
 const PORT = Number(process.env.PORT) || 3000;
 const API_KEY = process.env.API_KEY || "";                    // empty = auth disabled
 const MAX_TEXT = Number(process.env.MAX_TEXT) || 2000;        // characters per request
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 4;
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 60_000;
 const CACHE_MAX = Number(process.env.CACHE_MAX) || 200;       // cached clips
-const CHUNK_MAX = Number(process.env.CHUNK_MAX) || 60;        // max characters sent to Edge per request
+const CHUNK_MAX = Number(process.env.CHUNK_MAX) || 40;        // starting max characters per Edge request
+const MIN_CHUNK = 10;                                         // never split below this many characters
 const CHUNK_PARALLEL = Number(process.env.CHUNK_PARALLEL) || 3;
 const DEBUG = process.env.DEBUG_TTS === "1";                  // verbose msedge-tts protocol logging
 const DEFAULT_VOICE = process.env.DEFAULT_VOICE || "km-KH-SreymomNeural";
@@ -162,14 +163,48 @@ async function edgeMp3(text, voice, rate, signal) {
   }
 }
 
-async function edgeMp3WithRetry(text, voice, rate, signal) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const speakable = (t) => /[\p{L}\p{N}\p{M}]/u.test(t);
+
+// Split a string near its middle, on a word boundary when possible
+function halve(text) {
+  const units = wordSegmenter ? [...wordSegmenter.segment(text)].map((x) => x.segment) : [...text];
+  const half = len(text) / 2;
+  let acc = "", i = 0;
+  for (; i < units.length; i++) {
+    if (acc && len(acc) + len(units[i]) > half) break;
+    acc += units[i];
+  }
+  const a = acc.trim(), b = units.slice(i).join("").trim();
+  return a && b && speakable(a) && speakable(b) ? [a, b] : null;
+}
+
+// Per-voice learned chunk size: shrinks when Edge rejects a chunk that works when halved
+const voiceLimit = new Map();
+const chunkLimit = (voice) => voiceLimit.get(voice) ?? CHUNK_MAX;
+
+// Edge sometimes closes the socket on a chunk. Instead of retrying the same text,
+// split it in half and speak each half (recursively), then join the audio.
+async function speakChunk(text, voice, rate, signal) {
   try {
     return await edgeMp3(text, voice, rate, signal);
   } catch (err) {
     if (signal.aborted) throw err;
-    console.warn(`Chunk failed (${err.message}) len=${len(text)} text=${JSON.stringify(text.slice(0, 40))}; retrying`);
-    await new Promise((r) => setTimeout(r, 300));
-    return edgeMp3(text, voice, rate, signal);
+    const parts = len(text) > MIN_CHUNK ? halve(text) : null;
+    if (!parts) {
+      console.warn(`Chunk failed (${err.message}) len=${len(text)} text=${JSON.stringify(text)}; retrying as-is`);
+      await sleep(300);
+      return edgeMp3(text, voice, rate, signal);
+    }
+    console.warn(`Chunk failed len=${len(text)} text=${JSON.stringify(text.slice(0, 40))}; splitting into ${len(parts[0])}+${len(parts[1])}`);
+    const bufs = [];
+    for (const part of parts) bufs.push(await speakChunk(part, voice, rate, signal));
+    const smaller = Math.max(MIN_CHUNK, Math.floor(len(text) * 0.6));
+    if (smaller < chunkLimit(voice)) {
+      voiceLimit.set(voice, smaller);
+      console.warn(`Chunk limit for ${voice} lowered to ${smaller}`);
+    }
+    return Buffer.concat(bufs);
   }
 }
 
@@ -195,10 +230,10 @@ function toOpus(mp3, signal) {
   });
 }
 
-async function synthesize(text, voice, rate, signal, chunkMax = CHUNK_MAX) {
+async function synthesize(text, voice, rate, signal, chunkMax = chunkLimit(voice)) {
   const chunks = splitText(text, chunkMax);
   if (!chunks.length) throw Object.assign(new Error("Nothing speakable in text"), { status: 400 });
-  const mp3s = await mapLimit(chunks, CHUNK_PARALLEL, (c) => edgeMp3WithRetry(c, voice, rate, signal), signal);
+  const mp3s = await mapLimit(chunks, CHUNK_PARALLEL, (c) => speakChunk(c, voice, rate, signal), signal);
   const opus = await toOpus(Buffer.concat(mp3s), signal);
   return { opus, chunks: chunks.length };
 }
@@ -275,7 +310,7 @@ app.get("/diag", limiter, async (req, res) => {
   const voice = String(req.query.voice || DEFAULT_VOICE);
   if (!VOICE_RE.test(voice)) return res.status(400).json({ error: "Invalid voice" });
   const text = String(req.query.text || "សួស្តី! នេះគឺជាការសាកល្បងបំប្លែងអក្សរជាសំឡេង។ សូមអរគុណសម្រាប់ការប្រើប្រាស់សេវាកម្មនេះ។ សូមឱ្យអ្នកមានថ្ងៃល្អ។").slice(0, 500);
-  const chunkMax = Number(req.query.chunk) || CHUNK_MAX;
+  const chunkMax = Number(req.query.chunk) || chunkLimit(voice);
   const t0 = Date.now();
   try {
     const { opus, chunks } = await synthesize(text, voice, "+0%", AbortSignal.timeout(TIMEOUT_MS), chunkMax);
@@ -285,7 +320,48 @@ app.get("/diag", limiter, async (req, res) => {
   }
 });
 
-const server = app.listen(PORT, () => console.log(`Server ${VERSION} running on port ${PORT}`));
+// ---------- Probes: tell us exactly what Microsoft accepts from this server ----------
+const SREY = "km-KH-SreymomNeural", PISETH = "km-KH-PisethNeural";
+const K45 = "នេះគឺជាការសាកល្បងបំប្លែងអក្សរជាសំឡេងភាសាខ្មែរ";
+const PROBES = [
+  ["khmer-short", SREY, "សួស្តី"],
+  ["khmer-45", SREY, K45],
+  ["khmer-100", SREY, `${K45}។ សូមអរគុណសម្រាប់ការប្រើប្រាស់សេវាកម្មរបស់យើងខ្ញុំក្នុងថ្ងៃនេះ។`],
+  ["khmer+latin", SREY, "ប្រើ Temp Mail Bot ភ្លាមៗ"],
+  ["latin-only", SREY, "Temp Mail Bot"],
+  ["khmer-digits", SREY, "ជាង ១០ ឆ្នាំ"],
+  ["piseth-khmer-45", PISETH, K45],
+  ["piseth-khmer+latin", PISETH, "ប្រើ Temp Mail Bot ភ្លាមៗ"],
+  ["english-voice", "en-US-AriaNeural", "Temp Mail Bot"],
+];
+let lastProbe = null;
+
+async function runProbes() {
+  const results = [];
+  for (const [name, voice, text] of PROBES) {
+    const t0 = Date.now();
+    try {
+      const mp3 = await edgeMp3(text, voice, "+0%", AbortSignal.timeout(15_000));
+      results.push({ name, voice, chars: len(text), ok: true, bytes: mp3.length, ms: Date.now() - t0 });
+    } catch (err) {
+      results.push({ name, voice, chars: len(text), ok: false, ms: Date.now() - t0, error: err.message.slice(0, 80) });
+    }
+    const r = results.at(-1);
+    console.log(`PROBE ${r.ok ? "ok  " : "FAIL"} ${name.padEnd(20)} ${voice} chars=${r.chars} ${r.ms}ms${r.ok ? ` bytes=${r.bytes}` : ` (${r.error})`}`);
+  }
+  lastProbe = { version: VERSION, at: new Date().toISOString(), results };
+  return lastProbe;
+}
+
+app.get("/probe", limiter, async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: "Unauthorized" });
+  res.json(req.query.run === "1" || !lastProbe ? await runProbes() : lastProbe);
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`Server ${VERSION} running on port ${PORT}`);
+  if (process.env.PROBE_ON_START !== "0") setTimeout(() => runProbes().catch((e) => console.error("probe error", e)), 3000);
+});
 
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () => {
