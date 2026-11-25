@@ -11,6 +11,8 @@ const MAX_TEXT = Number(process.env.MAX_TEXT) || 3000;        // characters per 
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 4;
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 30_000;
 const CACHE_MAX = Number(process.env.CACHE_MAX) || 200;       // cached clips
+const VERSION = "1.2.0-ssml-escape-retry";                    // shown in /health and startup log
+const DEBUG = process.env.DEBUG_TTS === "1";                  // verbose msedge-tts protocol logging
 const DEFAULT_VOICE = "km-KH-SreymomNeural";
 const VOICE_RE = /^[a-z]{2,3}-[A-Z]{2}-\w+Neural$/;
 
@@ -42,6 +44,18 @@ function parseRate(speed) {
   return `${pct >= 0 ? "+" : ""}${pct}%`;
 }
 
+// msedge-tts pastes the text straight into SSML/XML without escaping it. A stray & < >
+// or a control character makes Microsoft drop the socket (-> "no turn.end received").
+function toSsmlText(text) {
+  return text
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, "") // illegal in XML
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 // Tiny LRU cache (Map preserves insertion order)
 const cache = new Map();
 function cacheGet(key) {
@@ -55,11 +69,11 @@ function cacheSet(key, buf) {
 }
 
 async function synthesize(text, voice, rate, signal) {
-  const tts = new MsEdgeTTS();
+  const tts = new MsEdgeTTS({ enableLogger: DEBUG });
   let ffmpeg;
   try {
     await tts.setMetadata(voice, SOURCE_FORMAT);
-    const { audioStream } = tts.toStream(text, { rate });
+    const { audioStream } = tts.toStream(toSsmlText(text), { rate });
 
     return await new Promise((resolve, reject) => {
       if (signal.aborted) return reject(signal.reason);
@@ -89,6 +103,16 @@ async function synthesize(text, voice, rate, signal) {
   }
 }
 
+async function synthesizeWithRetry(text, voice, rate, signal) {
+  try {
+    return await synthesize(text, voice, rate, signal);
+  } catch (err) {
+    if (signal.aborted) throw err;
+    console.warn(`TTS attempt 1 failed (${err.message}); retrying once`);
+    return synthesize(text, voice, rate, signal);
+  }
+}
+
 // ---------- App ----------
 const app = express();
 app.disable("x-powered-by");
@@ -96,7 +120,7 @@ app.set("trust proxy", 1); // correct client IPs behind Render/Railway/etc.
 app.use(express.json({ limit: "32kb" }));
 
 app.get("/", (_req, res) => res.send("Edge TTS + FFmpeg service is live."));
-app.get("/health", (_req, res) => res.json({ ok: true, active, cached: cache.size }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: VERSION, active, cached: cache.size }));
 
 const limiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
@@ -146,11 +170,11 @@ app.post("/tts", limiter, async (req, res) => {
 
   active++;
   try {
-    const audio = await synthesize(text, voice, rate, signal);
+    const audio = await synthesizeWithRetry(text, voice, rate, signal);
     cacheSet(key, audio);
     if (!res.destroyed) send(audio, false);
   } catch (err) {
-    console.error("TTS error:", err.message);
+    console.error(`TTS error: ${err.message} (voice=${voice} rate=${rate} len=${text.length} start=${JSON.stringify(text.slice(0, 40))})`);
     if (!res.headersSent && !res.destroyed) {
       res.status(err.name === "TimeoutError" ? 504 : 502).json({ error: "TTS failed" });
     }
@@ -159,7 +183,22 @@ app.post("/tts", limiter, async (req, res) => {
   }
 });
 
-const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Quick self-test: synthesizes a short Khmer phrase and reports the result.
+// curl -H "x-api-key: $API_KEY" https://YOUR-APP.onrender.com/diag
+app.get("/diag", limiter, async (req, res) => {
+  if (API_KEY && !safeEqual(String(req.get("x-api-key") || ""), API_KEY)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const t0 = Date.now();
+  try {
+    const audio = await synthesizeWithRetry("សួស្តី", DEFAULT_VOICE, "+0%", AbortSignal.timeout(TIMEOUT_MS));
+    res.json({ ok: true, version: VERSION, bytes: audio.length, ms: Date.now() - t0 });
+  } catch (err) {
+    res.status(502).json({ ok: false, version: VERSION, ms: Date.now() - t0, error: err.message });
+  }
+});
+
+const server = app.listen(PORT, () => console.log(`Server ${VERSION} running on port ${PORT}`));
 
 // Graceful shutdown for container platforms
 for (const sig of ["SIGTERM", "SIGINT"]) {
