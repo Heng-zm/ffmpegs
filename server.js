@@ -6,7 +6,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 
 // ---------- Config (override via environment variables) ----------
-const VERSION = "1.6.0-ffmpeg-pipelined";
+const VERSION = "1.7.0-sequential";
 const PORT = Number(process.env.PORT) || 3000;
 const API_KEY = process.env.API_KEY || "";                    // empty = auth disabled
 const MAX_TEXT = Number(process.env.MAX_TEXT) || 0;           // characters per request, 0 = unlimited
@@ -17,9 +17,9 @@ const CACHE_MAX_BYTES = 2 * 1024 * 1024;                          // clips large
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT) || 4;
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 60_000;   // base timeout; grows with the number of chunks
 const CACHE_MAX = Number(process.env.CACHE_MAX) || 200;       // cached clips
-const CHUNK_MAX = Number(process.env.CHUNK_MAX) || 40;        // starting max characters per Edge request
+const CHUNK_MAX = Number(process.env.CHUNK_MAX) || 35;        // max characters per Edge request
 const MIN_CHUNK = 10;                                         // never split below this many characters
-const CHUNK_PARALLEL = Number(process.env.CHUNK_PARALLEL) || 3;
+const CHUNK_PARALLEL = Number(process.env.CHUNK_PARALLEL) || 1; // 1 = one chunk at a time (gentlest on Edge)
 const DEBUG = process.env.DEBUG_TTS === "1";                  // verbose msedge-tts protocol logging
 const DEFAULT_VOICE = process.env.DEFAULT_VOICE || "km-KH-SreymomNeural";
 const VOICE_RE = /^[a-z]{2,3}-[A-Z]{2}-\w+Neural$/;
@@ -137,40 +137,54 @@ function cacheSet(key, buf) {
 async function mapLimit(items, limit, fn, signal) {
   const results = new Array(items.length);
   let next = 0, failed = false;
-  const worker = async () => {
+  const worker = async (w) => {
     while (!failed && !signal.aborted && next < items.length) {
       const i = next++;
-      try { results[i] = await fn(items[i], i); } catch (e) { failed = true; throw e; }
+      try { results[i] = await fn(items[i], i, w); } catch (e) { failed = true; throw e; }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, (_, w) => worker(w)));
   if (signal.aborted) throw signal.reason;
   return results;
 }
 
-// One Edge TTS request -> MP3 buffer
+// Collect an Edge audio stream into one MP3 buffer (and always detach the abort listener)
 function collect(stream, signal) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) return reject(signal.reason);
     const chunks = [];
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    const finish = (fn, value) => { signal.removeEventListener("abort", onAbort); fn(value); };
+    const onAbort = () => finish(reject, signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
     stream.on("data", (c) => chunks.push(c));
-    stream.on("error", reject);
+    stream.on("error", (e) => finish(reject, e));
     stream.on("end", () => {
       const buf = Buffer.concat(chunks);
-      buf.length ? resolve(buf) : reject(new Error("No audio data received"));
+      buf.length ? finish(resolve, buf) : finish(reject, new Error("No audio data received"));
     });
   });
 }
 
-async function edgeMp3(text, voice, rate, signal) {
-  const tts = new MsEdgeTTS({ enableLogger: DEBUG, synthesisTimeoutMs: 20_000 });
-  try {
-    await tts.setMetadata(voice, SOURCE_FORMAT);
-    const { audioStream } = tts.toStream(toSsmlText(text), { rate });
-    return await collect(audioStream, signal);
-  } finally {
-    try { tts.close(); } catch {}
+// One WebSocket to Edge, reused for the chunks of a request (fewer handshakes = fewer
+// connections for Microsoft to throttle). After any failure the socket is discarded.
+class EdgeSession {
+  constructor(voice) { this.voice = voice; this.tts = null; }
+  async speak(text, rate, signal) {
+    try {
+      if (!this.tts) {
+        this.tts = new MsEdgeTTS({ enableLogger: DEBUG, synthesisTimeoutMs: 20_000 });
+        await this.tts.setMetadata(this.voice, SOURCE_FORMAT);
+      }
+      const { audioStream } = this.tts.toStream(toSsmlText(text), { rate });
+      return await collect(audioStream, signal);
+    } catch (err) {
+      this.close();
+      throw err;
+    }
+  }
+  close() {
+    try { this.tts?.close(); } catch {}
+    this.tts = null;
   }
 }
 
@@ -190,33 +204,29 @@ function halve(text) {
   return a && b && speakable(a) && speakable(b) ? [a, b] : null;
 }
 
-// Per-voice learned chunk size: shrinks when Edge rejects a chunk that works when halved
-const voiceLimit = new Map();
-const chunkLimit = (voice) => voiceLimit.get(voice) ?? CHUNK_MAX;
+const chunkLimit = () => CHUNK_MAX;
 
-// Edge sometimes closes the socket on a chunk. Instead of retrying the same text,
-// split it in half and speak each half (recursively), then join the audio.
-async function speakChunk(text, voice, rate, signal) {
-  try {
-    return await edgeMp3(text, voice, rate, signal);
-  } catch (err) {
-    if (signal.aborted) throw err;
-    const parts = len(text) > MIN_CHUNK ? halve(text) : null;
-    if (!parts) {
-      console.warn(`Chunk failed (${err.message}) len=${len(text)} text=${JSON.stringify(text)}; retrying as-is`);
-      await sleep(300);
-      return edgeMp3(text, voice, rate, signal);
+// Edge sometimes closes the socket mid-request. Retry the same text once on a fresh socket after a
+// short pause; only if that also fails, split it in half (at most two levels deep). Splitting
+// immediately would multiply connections and make throttling worse.
+async function speakChunk(session, text, rate, signal, depth = 0) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await session.speak(text, rate, signal);
+    } catch (err) {
+      lastErr = err;
+      if (signal.aborted) throw err;
+      console.warn(`Chunk failed (attempt ${attempt}) len=${len(text)} text=${JSON.stringify(text.slice(0, 40))}`);
+      if (attempt < 2) await sleep(700);
     }
-    console.warn(`Chunk failed len=${len(text)} text=${JSON.stringify(text.slice(0, 40))}; splitting into ${len(parts[0])}+${len(parts[1])}`);
-    const bufs = [];
-    for (const part of parts) bufs.push(await speakChunk(part, voice, rate, signal));
-    const smaller = Math.max(MIN_CHUNK, Math.floor(len(text) * 0.6));
-    if (smaller < chunkLimit(voice)) {
-      voiceLimit.set(voice, smaller);
-      console.warn(`Chunk limit for ${voice} lowered to ${smaller}`);
-    }
-    return Buffer.concat(bufs);
   }
+  const parts = depth < 2 && len(text) > MIN_CHUNK ? halve(text) : null;
+  if (!parts) throw lastErr;
+  console.warn(`Splitting chunk len=${len(text)} into ${len(parts[0])}+${len(parts[1])}`);
+  const bufs = [];
+  for (const part of parts) bufs.push(await speakChunk(session, part, rate, signal, depth + 1));
+  return Buffer.concat(bufs);
 }
 
 // Long-lived-per-request FFmpeg encoder: MP3 chunks are written in as soon as they are ready,
@@ -256,12 +266,13 @@ async function synthesize(text, voice, rate, signal, chunkMax = chunkLimit(voice
   const sig = AbortSignal.any([signal, stop.signal]);
   const enc = startOpus();
   enc.done.catch((e) => stop.abort(e));
+  const sessions = Array.from({ length: Math.min(CHUNK_PARALLEL, chunks.length) }, () => new EdgeSession(voice));
 
   try {
     const ready = new Map();
     let nextToWrite = 0;
-    await mapLimit(chunks, CHUNK_PARALLEL, async (chunk, i) => {
-      ready.set(i, await speakChunk(chunk, voice, rate, sig));
+    await mapLimit(chunks, CHUNK_PARALLEL, async (chunk, i, w) => {
+      ready.set(i, await speakChunk(sessions[w], chunk, rate, sig));
       // chunks finish out of order; feed ffmpeg strictly in order
       while (ready.has(nextToWrite)) {
         enc.write(ready.get(nextToWrite));
@@ -273,6 +284,8 @@ async function synthesize(text, voice, rate, signal, chunkMax = chunkLimit(voice
   } catch (err) {
     enc.kill();
     throw err;
+  } finally {
+    sessions.forEach((x) => x.close());
   }
 }
 
@@ -365,32 +378,70 @@ app.get("/diag", limiter, async (req, res) => {
 
 // ---------- Probes: tell us exactly what Microsoft accepts from this server ----------
 const SREY = "km-KH-SreymomNeural", PISETH = "km-KH-PisethNeural";
-const K45 = "នេះគឺជាការសាកល្បងបំប្លែងអក្សរជាសំឡេងភាសាខ្មែរ";
-const PROBES = [
+const LONG = "នេះគឺជាការសាកល្បងបំប្លែងអក្សរជាសំឡេងភាសាខ្មែរ។ សូមអរគុណសម្រាប់ការប្រើប្រាស់សេវាកម្មរបស់យើងខ្ញុំក្នុងថ្ងៃនេះ។ សូមឱ្យអ្នកមានថ្ងៃល្អ និងសុខភាពល្អជានិច្ច។ សូមអរគុណ។";
+const part = (n) => cutByLength(LONG, n)[0].trim();
+const SINGLE_PROBES = [
   ["khmer-short", SREY, "សួស្តី"],
-  ["khmer-45", SREY, K45],
-  ["khmer-100", SREY, `${K45}។ សូមអរគុណសម្រាប់ការប្រើប្រាស់សេវាកម្មរបស់យើងខ្ញុំក្នុងថ្ងៃនេះ។`],
-  ["khmer+latin", SREY, "ប្រើ Temp Mail Bot ភ្លាមៗ"],
-  ["latin-only", SREY, "Temp Mail Bot"],
-  ["khmer-digits", SREY, "ជាង ១០ ឆ្នាំ"],
-  ["piseth-khmer-45", PISETH, K45],
-  ["piseth-khmer+latin", PISETH, "ប្រើ Temp Mail Bot ភ្លាមៗ"],
-  ["english-voice", "en-US-AriaNeural", "Temp Mail Bot"],
+  ["khmer-45", SREY, part(45)],
+  ["khmer-60", SREY, part(60)],
+  ["khmer-80", SREY, part(80)],
+  ["khmer-100", SREY, part(100)],
+  ["piseth-45", PISETH, part(45)],
+  ["piseth-80", PISETH, part(80)],
 ];
 let lastProbe = null;
 
+async function probeOne(name, voice, text) {
+  const t0 = Date.now();
+  const session = new EdgeSession(voice);
+  try {
+    const mp3 = await session.speak(text, "+0%", AbortSignal.timeout(15_000));
+    return { name, voice, chars: len(text), ok: true, audioSec: +(mp3.length / 6000).toFixed(1), ms: Date.now() - t0 };
+  } catch (err) {
+    return { name, voice, chars: len(text), ok: false, ms: Date.now() - t0, error: err.message.slice(0, 60) };
+  } finally {
+    session.close();
+  }
+}
+
+// Several 35-char chunks: one socket reused sequentially, and 3 sockets at once
+async function probeMulti(name, voice, parallel) {
+  const t0 = Date.now();
+  const chunks = splitText(LONG, 35).slice(0, parallel ? 3 : 4);
+  const sessions = Array.from({ length: parallel ? 3 : 1 }, () => new EdgeSession(voice));
+  const signal = AbortSignal.timeout(30_000);
+  let okCount = 0;
+  try {
+    if (parallel) {
+      const rs = await Promise.allSettled(chunks.map((c, i) => sessions[i].speak(c, "+0%", signal)));
+      okCount = rs.filter((r) => r.status === "fulfilled").length;
+    } else {
+      for (const c of chunks) {
+        try { await sessions[0].speak(c, "+0%", signal); okCount++; } catch {}
+      }
+    }
+  } finally {
+    sessions.forEach((x) => x.close());
+  }
+  return { name, voice, chars: chunks.map(len).join("+"), ok: okCount === chunks.length, okCount, of: chunks.length, ms: Date.now() - t0 };
+}
+
 async function runProbes() {
   const results = [];
-  for (const [name, voice, text] of PROBES) {
-    const t0 = Date.now();
-    try {
-      const mp3 = await edgeMp3(text, voice, "+0%", AbortSignal.timeout(15_000));
-      results.push({ name, voice, chars: len(text), ok: true, bytes: mp3.length, ms: Date.now() - t0 });
-    } catch (err) {
-      results.push({ name, voice, chars: len(text), ok: false, ms: Date.now() - t0, error: err.message.slice(0, 80) });
-    }
-    const r = results.at(-1);
-    console.log(`PROBE ${r.ok ? "ok  " : "FAIL"} ${name.padEnd(20)} ${voice} chars=${r.chars} ${r.ms}ms${r.ok ? ` bytes=${r.bytes}` : ` (${r.error})`}`);
+  const log = (r) => console.log(
+    `PROBE ${r.ok ? "ok  " : "FAIL"} ${r.name.padEnd(14)} ${r.voice} chars=${r.chars}` +
+    (r.audioSec !== undefined ? ` audio=${r.audioSec}s` : "") +
+    (r.of ? ` ok=${r.okCount}/${r.of}` : "") + ` ${r.ms}ms` + (r.error ? ` (${r.error})` : ""));
+  const steps = [
+    ...SINGLE_PROBES.map(([n, v, t]) => () => probeOne(n, v, t)),
+    () => probeMulti("seq-4x35", SREY, false),
+    () => probeMulti("par-3x35", SREY, true),
+  ];
+  for (const step of steps) {
+    const r = await step();
+    results.push(r);
+    log(r);
+    await sleep(1000); // do not hammer Edge while diagnosing it
   }
   lastProbe = { version: VERSION, at: new Date().toISOString(), results };
   return lastProbe;
