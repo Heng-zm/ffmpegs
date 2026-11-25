@@ -1,11 +1,12 @@
 import express from "express";
 import rateLimit from "express-rate-limit";
 import { spawn } from "node:child_process";
+import os from "node:os";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 
 // ---------- Config (override via environment variables) ----------
-const VERSION = "1.5.0-unlimited";
+const VERSION = "1.6.0-ffmpeg-pipelined";
 const PORT = Number(process.env.PORT) || 3000;
 const API_KEY = process.env.API_KEY || "";                    // empty = auth disabled
 const MAX_TEXT = Number(process.env.MAX_TEXT) || 0;           // characters per request, 0 = unlimited
@@ -24,13 +25,19 @@ const DEFAULT_VOICE = process.env.DEFAULT_VOICE || "km-KH-SreymomNeural";
 const VOICE_RE = /^[a-z]{2,3}-[A-Z]{2}-\w+Neural$/;
 
 const SOURCE_FORMAT = OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3;
+// Opus encoder effort: 0 = fastest ... 10 = best (ffmpeg's default is 10). On a tiny CPU like
+// Render's free plan, 3 is ~45% cheaper than 10 with no audible difference for speech.
+const FFMPEG_COMPLEXITY = String(Math.min(10, Math.max(0, parseInt(process.env.FFMPEG_COMPLEXITY ?? "3", 10) || 0)));
 const FFMPEG_ARGS = [
-  "-hide_banner", "-loglevel", "error",
-  "-i", "pipe:0",
-  "-vn",
+  "-hide_banner", "-loglevel", "error", "-nostdin",
+  "-f", "mp3", "-i", "pipe:0",          // input format is known: skip format probing
+  "-vn", "-sn", "-dn", "-map", "0:a:0", // audio only
+  "-map_metadata", "-1",                // strip tags
+  "-threads", "1",                      // no thread overhead on a fractional CPU
   "-c:a", "libopus",
-  "-application", "voip",   // tuned for speech
+  "-application", "voip",               // tuned for speech
   "-b:a", "32k",
+  "-compression_level", FFMPEG_COMPLEXITY,
   "-ar", "48000",
   "-ac", "1",
   "-f", "ogg",
@@ -212,17 +219,18 @@ async function speakChunk(text, voice, rate, signal) {
   }
 }
 
-// MP3 buffer -> Ogg/Opus buffer
-function toOpus(mp3, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) return reject(signal.reason);
-    const ff = spawn("ffmpeg", FFMPEG_ARGS, { stdio: ["pipe", "pipe", "pipe"] });
-    const out = [];
-    let stderr = "";
-    signal.addEventListener("abort", () => { ff.kill("SIGKILL"); reject(signal.reason); }, { once: true });
-    ff.stdout.on("data", (c) => out.push(c));
-    ff.stderr.on("data", (d) => { if (stderr.length < 2000) stderr += d; });
-    ff.stdin.on("error", () => {});
+// Long-lived-per-request FFmpeg encoder: MP3 chunks are written in as soon as they are ready,
+// so encoding overlaps with synthesis instead of waiting for the last chunk.
+function startOpus() {
+  const ff = spawn("ffmpeg", FFMPEG_ARGS, { stdio: ["pipe", "pipe", "pipe"] });
+  // lower priority so encoding never starves the event loop / Edge WebSockets on a tiny CPU
+  try { os.setPriority(ff.pid, 10); } catch {}
+  const out = [];
+  let stderr = "";
+  ff.stdout.on("data", (c) => out.push(c));
+  ff.stderr.on("data", (d) => { if (stderr.length < 2000) stderr += d; });
+  ff.stdin.on("error", () => {}); // EPIPE if ffmpeg exits early; reported via `done`
+  const done = new Promise((resolve, reject) => {
     ff.on("error", reject);
     ff.on("close", (code) => {
       const buf = Buffer.concat(out);
@@ -230,16 +238,42 @@ function toOpus(mp3, signal) {
         ? resolve(buf)
         : reject(new Error(`ffmpeg exited ${code}: ${stderr.trim() || "no output"}`));
     });
-    ff.stdin.end(mp3);
   });
+  done.catch(() => {}); // avoid an unhandled rejection before anyone awaits it
+  return {
+    done,
+    write: (buf) => { if (ff.stdin.writable) ff.stdin.write(buf); },
+    end: () => ff.stdin.end(),
+    kill: () => { if (ff.exitCode === null) ff.kill("SIGKILL"); },
+  };
 }
 
 async function synthesize(text, voice, rate, signal, chunkMax = chunkLimit(voice)) {
   const chunks = splitText(text, chunkMax);
   if (!chunks.length) throw Object.assign(new Error("Nothing speakable in text"), { status: 400 });
-  const mp3s = await mapLimit(chunks, CHUNK_PARALLEL, (c) => speakChunk(c, voice, rate, signal), signal);
-  const opus = await toOpus(Buffer.concat(mp3s), signal);
-  return { opus, chunks: chunks.length };
+
+  const stop = new AbortController(); // lets an ffmpeg crash cancel the remaining synthesis
+  const sig = AbortSignal.any([signal, stop.signal]);
+  const enc = startOpus();
+  enc.done.catch((e) => stop.abort(e));
+
+  try {
+    const ready = new Map();
+    let nextToWrite = 0;
+    await mapLimit(chunks, CHUNK_PARALLEL, async (chunk, i) => {
+      ready.set(i, await speakChunk(chunk, voice, rate, sig));
+      // chunks finish out of order; feed ffmpeg strictly in order
+      while (ready.has(nextToWrite)) {
+        enc.write(ready.get(nextToWrite));
+        ready.delete(nextToWrite++);
+      }
+    }, sig);
+    enc.end();
+    return { opus: await enc.done, chunks: chunks.length };
+  } catch (err) {
+    enc.kill();
+    throw err;
+  }
 }
 
 // ---------- App ----------
